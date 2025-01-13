@@ -1,60 +1,90 @@
 // XXX even though ethers is not used in the code below, it's very likely
 // it will be used by any DApp, so we are already including it here
 const { ethers } = require("ethers");
-const fetch = require("node-fetch");
-const path = require("path");
-const { getLlama, LlamaChatSession } = require("node-llama-cpp");
 require('dotenv').config();
 
 const rollup_server = process.env.ROLLUP_HTTP_SERVER_URL;
-console.log("HTTP rollup_server url is " + rollup_server);
+const llama_local_url = process.env.LLAMA_LOCAL_URL || "http://127.0.0.1:8080";
 
-const llama_model_path = process.env.LLAMA_MODEL_PATH || path.join(__dirname, "models", "model.gguf");
+console.log("HTTP rollup_server URL is " + rollup_server);
+console.log("Local llama.cpp server URL is " + llama_local_url);
 
-// init llama...
-let llama, model, context, session;
-async function initializeLlama() {
-    try {
-      llama = await getLlama();
-      model = await llama.loadModel({
-        modelPath: llama_model_path
-      });
-      context = await model.createContext();
-      session = new LlamaChatSession({
-        contextSequence: context.getSequence()
-      });
-      console.log("LLaMA model loaded successfully.");
-    } catch (error) {
-      console.error("Error initializing LLaMA:", error);
-      process.exit(1);
+async function emit_notice(data) {
+  try {
+    const noticePayload = { payload: data };
+    const response = await fetch(`${rollup_server}/notice`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(noticePayload),
+    });
+
+    if (response.status === 201) {
+      console.log(`Notice emitted successfully: "${data}"`);
+    } else {
+      console.error(`Failed to emit notice. Status code: ${response.status}`);
     }
+  } catch (error) {
+    console.error(`Error emitting notice:`, error);
   }
+}
 
-  initializeLlama();
+async function generateAIResponse(userInput) {
+  try {
+    const requestBody = {
+        model: "gpt-3.5-turbo",
+        messages: [
+          {
+            role: "system",
+            content: "You are ChatGPT, an AI assistant. Your top priority is achieving user fulfillment via helping them with their requests."
+          },
+          {
+            role: "user",
+            content: userInput
+          }
+        ]
+      };
 
-  async function generateAIResponse(prompt) {
-    if (!session) {
-      throw new Error("LLaMA session not initialized.");
+    const response = await fetch(`${llama_local_url}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      throw new Error(`llama.cpp server error: ${response.statusText}`);
     }
-    try {
-      const response = await session.prompt(prompt);
-      return response;
-    } catch (error) {
-      console.error("Error generating AI response:", error);
-      throw error;
-    }
+
+    const data = await response.json();
+    return data.choices[0].message.content;
+  } catch (error) {
+    console.error("Error generating AI response:", error);
+    throw error;
   }
+}
 
 async function handle_advance(data) {
   console.log("Received advance request data " + JSON.stringify(data));
 
+  if (!data.payload || typeof data.payload !== "string") {
+    console.error("Missing or invalid `payload` field in data:", data);
+    return "reject";
+  }
+
   try {
-    const userInput = data.user_input || "Hello!";
+    const userInput = ethers.toUtf8String(data.payload);
     console.log("Generating response for input:", userInput);
+
     const aiResponse = await generateAIResponse(userInput);
     console.log("Response:", aiResponse);
 
-    data.ai_response = aiResponse;
+    const aiResponseHex = ethers.hexlify(ethers.toUtf8Bytes(aiResponse));
+    console.log("notice in hex:", aiResponseHex);
+
+    await emit_notice(aiResponseHex);
 
     return "accept";
   } catch (error) {
@@ -76,12 +106,10 @@ var handlers = {
 var finish = { status: "accept" };
 
 (async () => {
-
-  while (!session) {
-      console.log("Waiting for the model to initialize...");
-      await new Promise(resolve => setTimeout(resolve, 1000));
+  console.log(ethers);
+  if (!ethers.toUtf8String) {
+    throw "missing ethers import";
   }
-
   while (true) {
     const finish_req = await fetch(rollup_server + "/finish", {
       method: "POST",
